@@ -16,7 +16,7 @@
 .venv/bin/python -m unlimited_ocr.cli inputs/page-1.png inputs/page-2.png --max-new-tokens 4096 --output results/document.json
 
 # 使用已导出的离线模型；导出步骤见“离线量化与部署”
-.venv/bin/python -m unlimited_ocr.cli inputs/page.png --model-dir models/unlimited-ocr-2-int8
+.venv/bin/python -m unlimited_ocr.cli inputs/page.png --model-dir models/unlimited-ocr-2-int8-v2
 
 # 完整参数说明
 .venv/bin/python -m unlimited_ocr.cli --help
@@ -36,6 +36,7 @@
 | `load_seconds` | 加载、量化、优化安装和输入准备的时间，与生成耗时分开 |
 | `isa` / `weight_format` | 实际策略与权重格式，不能只根据请求参数判断是否启用了加速 |
 | `attention_backend` / `norm_backend` | 实际注意力 / 归一化实现 |
+| `linear_backend` / `native_moe` | 实际线性层后端 / 已安装原生调度的 MoE 模块数 |
 
 `--model-dir` 同时指定权重、配置和 tokenizer 所在目录，支持原始 BF16 数据与本项目
 [导出的离线 INT8 目录](offline-model.md)，不需要另外指定 tokenizer。
@@ -74,7 +75,9 @@ print(second["finish_reason"], second["text"])
 不支持在同一进程中并发调用不同请求或其他模型。
 
 使用离线模型时，将初始化改为
-`load_ocr(model_dir="models/unlimited-ocr-2-int8")`；示例命令行同样支持 `--model-dir`。
+`load_ocr(model_dir="models/unlimited-ocr-2-int8-v2")`；示例命令行同样支持 `--model-dir`。
 
-示例固定使用当前模型版本的内部生成接口，不是通用 Hugging Face 模型 API；需要完整
-运行参数时使用命令行入口。有关量化、线程和 ISA 设置，参见 [硬件与量化](acceleration.md)。
+OCR 入口内部使用标准 `GenerationMixin.generate()`，并接入本模型的页数、重复 n-gram、
+缓存和流式输出约束。它不是任意 HF 模型的通用封装；直接调用裸 `.generate()` 不会自动
+获得这些 OCR 约束，应用集成优先使用上述入口。当前验证的 Transformers 版本为 4.52.1，
+并未宣称兼容所有后续版本。有关量化、线程和 ISA 设置，参见 [硬件与量化](acceleration.md)。

@@ -49,9 +49,10 @@ def main():
     if args.vision_bf16:
         from unlimited_ocr.cpu_bf16_vision import install_bf16_sam
         bf16_vision = install_bf16_sam(model, directory=args.model_dir)
+    native_moe = 0
     if model._cpu_quantized_weights:
-        from unlimited_ocr.cpu_moe_script import install_scripted_moe
-        install_scripted_moe(model)
+        from unlimited_ocr.cpu_moe_native import install_native_moe
+        native_moe = install_native_moe(model)
     decode_threads = args.decode_threads or args.threads
     install_stage_threads(model, args.vision_threads, args.threads, decode_threads)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
@@ -59,6 +60,8 @@ def main():
     inputs = _uocr_build_inputs(tokenizer, "<PAGE><image>" * len(args.images) + "Multi page parsing.",
                                 [Image.open(p).convert("RGB") for p in args.images], crop_mode=False)
     result = dict(isa=isa_report(), weight_format=model._cpu_weight_format,
+                  native_moe=native_moe,
+                  linear_backend="fbgemm" if model._cpu_quantized_weights else "fp32_dequantize" if model._cpu_weight_format == "int8_dequantize" else "torch",
                   bf16_vision=bf16_vision,
                   prefill_threads=args.threads, vision_threads=args.vision_threads,
                   decode_threads=decode_threads, load_seconds=time.perf_counter() - started,

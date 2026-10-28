@@ -22,7 +22,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
 先从 CPU wheel 索引安装 Torch / TorchVision，再安装其余依赖。不要直接升级到未经测试的
-Torch 版本：量化接口、TorchScript 和 FBGEMM 探针都依赖其具体实现。
+Torch 版本：原生 FBGEMM 接口和探针依赖其 C++ ABI，需要匹配头文件与动态库。
 
 ## 2. 下载并校验模型
 
@@ -63,11 +63,13 @@ HF_HUB_DISABLE_XET=1 .venv/bin/python -m tools.fetch_weights
 ```
 
 构建结果放在 `unlimited_ocr/` 内：`native.so`、`native_attention.so`，以及可选诊断探针
-`isa_probe.so`。换机器或升级 PyTorch 后应重新构建，不复制虚拟环境和二进制。
+`isa_probe.so`，以及通过 `torch.library` 注册线性层和 MoE 算子的 `linear.so`。
+换机器或升级 PyTorch 后应重新构建，不复制虚拟环境和二进制。
 
 不要给整个共享库添加 `-march=native`、`-mavx2` 或 `-mavx512*`；构建脚本仅在特定
 helper 内启用 SIMD，以免破坏不支持这些指令的 CPU 的回退路径。没有可用原生库时，
-归一化和注意力可退回 PyTorch，但完整原生内核测试需要先构建。
+归一化和注意力可退回 PyTorch，INT8 线性层可退回逐算子解量化的 FP32 计算；
+完整原生内核测试和离线导出需要先构建。
 
 运行失败时，先确认工作目录、数据是否完整，以及依赖版本；选择具体加速路径的方法见
 [硬件与量化](acceleration.md)。

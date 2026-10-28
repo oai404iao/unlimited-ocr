@@ -24,6 +24,15 @@ def main():
         "-L", str(torch_root / "lib"), "-ltorch_cpu",
         f"-Wl,-rpath,{torch_root / 'lib'}", "-o", str(output / "isa_probe.so"),
     ], check=True)
+    import torch
+    subprocess.run([
+        "g++", "-O3", "-std=c++20", "-shared", "-fPIC", "-fopenmp",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+        str(sources / "linear.cpp"), "-I", str(torch_root / "include"),
+        "-I", str(torch_root / "include/torch/csrc/api/include"),
+        "-L", str(torch_root / "lib"), "-ltorch_cpu", "-ltorch", "-lc10",
+        f"-Wl,-rpath,{torch_root / 'lib'}", "-o", str(output / "linear.so"),
+    ], check=True)
 
 
 if __name__ == "__main__":

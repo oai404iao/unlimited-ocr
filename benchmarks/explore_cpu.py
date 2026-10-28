@@ -129,16 +129,16 @@ def main():
     elif args.mode == "remaining":
         from unlimited_ocr.cpu_sam_layout import install_sam_layout
         from unlimited_ocr.cpu_router import install_router
-        from unlimited_ocr.cpu_moe_script import install_scripted_moe
+        from unlimited_ocr.cpu_moe_native import install_native_moe
         install_sam_layout(model)
         for i in range(args.repeats):
             run(f"layout-{i}")
         install_router()
         for i in range(args.repeats):
             run(f"router-{i}")
-        install_scripted_moe(model)
+        install_native_moe(model)
         for i in range(args.repeats):
-            run(f"scripted-moe-{i}")
+            run(f"native-moe-{i}")
         run("remaining-profile", profile=True)
 
 

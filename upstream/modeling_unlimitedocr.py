@@ -53,6 +53,7 @@ import os
 from .deepencoder import build_sam_vit_b, build_clip_l, MlpProjector
 from addict import Dict
 from transformers import TextStreamer
+from transformers.generation import GenerationConfig, GenerationMixin, LogitsProcessor
 from .conversation import get_conv_template
 from abc import ABC
 import math
@@ -623,6 +624,61 @@ def _uocr_no_repeat_ngram(logits, gen_ids, ngram_size, window_size, whitelist):
     return logits
 
 
+class _UOCRLogitsProcessor(LogitsProcessor):
+    """Request-owned OCR constraints, applied only to generated tokens."""
+    def __init__(self, prompt_length, expected_pages, page_id, eos_id,
+                 max_page_tokens, ngram_size, ngram_window, ngram_whitelist):
+        self.prompt_length = prompt_length
+        self.expected_pages = expected_pages
+        self.page_id, self.eos_id = page_id, eos_id
+        self.max_page_tokens = max_page_tokens
+        self.ngram_size, self.ngram_window = ngram_size, ngram_window
+        self.ngram_whitelist = ngram_whitelist or set()
+        self.guard_state = {'marker_cum': 0, 'scanned': 0, 'page_len': 0}
+
+    def __call__(self, input_ids, scores):
+        if input_ids.shape[0] != 1:
+            raise ValueError("OCR generation supports batch size 1 only")
+        generated = input_ids[0, self.prompt_length:].tolist()
+        _uocr_no_repeat_ngram(scores[0], generated, self.ngram_size,
+                              self.ngram_window, self.ngram_whitelist)
+        _uocr_page_count_guard(scores[0], generated, self.expected_pages,
+                              self.page_id, self.eos_id, self.max_page_tokens, self.guard_state)
+        return scores
+
+
+class _UOCRStreamer:
+    """Observe first-token timing, excluding prompt and EOS from text output."""
+    def __init__(self, tokenizer, stream, tps_interval):
+        self.eos_id = int(tokenizer.eos_token_id)
+        self.output = TextStreamer(tokenizer, skip_prompt=False, skip_special_tokens=False) if stream else None
+        self.tps_interval = tps_interval
+        self.first_time = None
+        self.prompt_pending = True
+        self.count = 0
+        self.ended = False
+
+    def put(self, value):
+        if self.prompt_pending:
+            self.prompt_pending = False
+            return
+        if self.first_time is None:
+            self.first_time = time.perf_counter()
+        if int(value.item()) == self.eos_id:
+            return
+        self.count += 1
+        if self.output is not None:
+            self.output.put(value)
+        if self.tps_interval and self.count % self.tps_interval == 0:
+            elapsed = time.perf_counter() - self.first_time
+            print(f'\n[TPS] tokens={self.count} avg={self.count / max(elapsed, 1e-6):.1f} t/s', flush=True)
+
+    def end(self):
+        if not self.ended and self.output is not None:
+            self.output.end()
+        self.ended = True
+
+
 class UnlimitedOCRConfig(DeepseekV2Config):
     model_type = "unlimited-ocr"
 
@@ -836,7 +892,8 @@ class UnlimitedOCRForCausalLM(DeepseekV2ForCausalLM):
         images_seq_mask: Optional[torch.FloatTensor] = None,
         images_spatial_crop: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
-        
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -894,7 +951,9 @@ class UnlimitedOCRForCausalLM(DeepseekV2ForCausalLM):
                 )
             _td_report(f"seq={hidden_states.shape[1]}")
         else:
-            logits = self.lm_head(hidden_states)
+            # Only the requested final positions reach the vocabulary projection.
+            head_states = hidden_states[:, -logits_to_keep:] if labels is None and logits_to_keep else hidden_states
+            logits = self.lm_head(head_states)
             logits = logits.float()
 
             if labels is not None:
@@ -943,87 +1002,25 @@ class UnlimitedOCRForCausalLM(DeepseekV2ForCausalLM):
 
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
+        cache_position=None, **kwargs
     ):
-        # Omit tokens covered by past_key_values
-        past_length = 0
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.get_seq_length()
-                max_cache_length = getattr(past_key_values, 'get_max_length', lambda: None)()
-            else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
-                max_cache_length = None
-
-            # Ring buffer: cache size is fixed, but we've processed more tokens.
-            # Always just take the last token for decode.
-            if hasattr(past_key_values, '_prefill_length') and past_length > 0:
-                input_ids = input_ids[:, -1:]
-            # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
-            # input)
-            elif attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
-            if (
-                max_cache_length is not None
-                and attention_mask is not None
-                and cache_length + input_ids.shape[1] > max_cache_length
-            ):
-                attention_mask = attention_mask[:, -max_cache_length:]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        # if self.generation_config.cache_implementation == "static":
-        #     # generation with static cache
-        #     cache_position = kwargs.get("cache_position", None)
-        #     if cache_position is None:
-        #         past_length = 0
-        #     else:
-        #         past_length = cache_position[-1] + 1
-        #     input_ids = input_ids[:, past_length:]
-        #     position_ids = position_ids[:, past_length:]
-
-        # TODO @gante we should only keep a `cache_position` in generate, and do +=1.
-        # same goes for position ids. Could also help with continued generation.
-        cache_position = torch.arange(past_length, past_length + position_ids.shape[-1], device=position_ids.device)
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        # Pass images only on prefill (cache empty or None)
-        _is_prefill = (past_key_values is None or
-                       (isinstance(past_key_values, Cache) and past_key_values.get_seq_length() == 0))
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "images": kwargs.get("images", None) if _is_prefill else None,
-                "images_seq_mask": kwargs.get("images_seq_mask", None) if _is_prefill else None,
-                "images_spatial_crop": kwargs.get("images_spatial_crop", None) if _is_prefill else None,
-            }
+        if input_ids.shape[0] != 1:
+            raise ValueError("OCR generation supports batch size 1 only")
+        past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if cache_position is None:
+            length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+            cache_position = torch.arange(past_length, max(past_length + 1, length), device=input_ids.device)
+        model_inputs = GenerationMixin.prepare_inputs_for_generation(
+            self, input_ids, past_key_values=past_key_values, attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds, cache_position=cache_position, **kwargs,
         )
+        # Images and their page positions are injected only into a fresh prefill.
+        if past_length:
+            for key in ("images", "images_seq_mask", "images_spatial_crop"):
+                model_inputs[key] = None
         return model_inputs
-    
+
 
     def disable_torch_init(self):
         """
@@ -1127,82 +1124,70 @@ class UnlimitedOCRForCausalLM(DeepseekV2ForCausalLM):
                        max_length=131072, temperature=0.0, page_count_guard=True, max_page_tokens=20000,
                        ngram_size=0, ngram_window=100, ngram_whitelist=None, dash_topm=16,
                        stream=False, tps_interval=0):
-        """Prefill + token-by-token decode on a DynamicCache (no HF generate()).
-        Only the last position goes through lm_head (full-sequence logits at 30k tokens x
-        129k vocab would not fit)."""
-        import time
-        from unlimited_ocr.cpu_cache import CPUCache as DynamicCache
+        """Standard HF generation with request-owned OCR constraints and timing."""
+        from unlimited_ocr.cpu_cache import CPUCache
         device = self.model.embed_tokens.weight.device
         ids = input_ids.unsqueeze(0).to(device)
+        if ids.ndim != 2 or ids.shape[0] != 1 or not ids.shape[1]:
+            raise ValueError("OCR generation requires one nonempty token sequence")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be nonnegative")
         prompt_ids = input_ids.tolist()
         page_id = int((self.config.sparse_attention_config or {}).get('page_token_id', 128827)) \
             if isinstance(getattr(self.config, 'sparse_attention_config', None), dict) else 128827
         eos_id = int(tokenizer.eos_token_id)
         expected_pages = prompt_ids.count(page_id) if page_count_guard else 0
-        guard_st = {'marker_cum': 0, 'scanned': 0, 'page_len': 0}
+        processor = _UOCRLogitsProcessor(len(prompt_ids), expected_pages, page_id, eos_id,
+                                        max_page_tokens, ngram_size, ngram_window, ngram_whitelist)
+        observer = _UOCRStreamer(tokenizer, stream, tps_interval)
         kw = {}
         if imgs is not None:
             kw = dict(images=[(imgs[0].to(device=device, dtype=torch.float32), imgs[1].to(device=device, dtype=torch.float32), spatial)],
-                      images_seq_mask=seq_mask.unsqueeze(0).to(device),
-                      images_spatial_crop=spatial)
-
-        # decode-time knobs: no ring-buffer SWA (vLLM attends via DASH), vLLM-parity router
+                      images_seq_mask=seq_mask.unsqueeze(0).to(device), images_spatial_crop=spatial)
         cfg = self.config
         saved_cfg = (getattr(cfg, '_ring_window', None), getattr(cfg, 'sliding_window', None))
         cfg._ring_window = None
         cfg.sliding_window = None
         dash_state = configure_dash_inference(self.model, True, topm=dash_topm)
-        streamer = TextStreamer(tokenizer, skip_prompt=False, skip_special_tokens=False) if stream else None
         gen, finish = [], 'length'
         t0 = time.perf_counter()
-        t_first = None
         try:
-            cache = DynamicCache()
-            S = ids.shape[1]
-            out = self.model(input_ids=ids, past_key_values=cache, use_cache=True,
-                             position_ids=torch.arange(S, device=device)[None], return_dict=True, **kw)
-            cache = out.past_key_values
-            h = out.last_hidden_state[:, -1:]
-            for step in range(max_new_tokens):
-                logits = self.lm_head(h).float()[0, -1]
-                if ngram_size > 0:
-                    logits = _uocr_no_repeat_ngram(logits, gen, ngram_size, ngram_window, ngram_whitelist or set())
-                if expected_pages > 0:
-                    logits = _uocr_page_count_guard(logits, gen, expected_pages, page_id, eos_id,
-                                                    max_page_tokens, guard_st)
-                if temperature and temperature > 0:
-                    nxt = int(torch.multinomial(torch.softmax(logits / temperature, dim=-1), 1))
-                else:
-                    nxt = int(torch.argmax(logits))
-                if t_first is None:
-                    t_first = time.perf_counter()
-                if nxt == eos_id:
+            # Preserve the old loop's total-length boundary, including its first-token allowance.
+            budget = min(max_new_tokens, max(1, max_length - ids.shape[1]))
+            if budget:
+                config = GenerationConfig(
+                    max_new_tokens=budget, do_sample=bool(temperature and temperature > 0),
+                    temperature=temperature if temperature and temperature > 0 else 1.0,
+                    top_k=0 if temperature and temperature > 0 else None,
+                    top_p=1.0, num_beams=1, num_return_sequences=1,
+                    eos_token_id=eos_id, pad_token_id=eos_id, use_cache=True,
+                )
+                sequences = self.generate(
+                    input_ids=ids, attention_mask=torch.ones_like(ids),
+                    # HF 4.52 otherwise replaces values equal to library defaults
+                    # with model defaults (the checkpoint has use_cache=False).
+                    generation_config=config, use_model_defaults=False, use_cache=True,
+                    past_key_values=CPUCache(),
+                    logits_processor=[processor], streamer=observer, logits_to_keep=1, **kw,
+                )
+                gen = sequences[0, ids.shape[1]:].tolist()
+                if gen and gen[-1] == eos_id:
                     finish = 'stop'
-                    break
-                gen.append(nxt)
-                if streamer is not None:
-                    streamer.put(torch.tensor([nxt]))
-                if tps_interval and len(gen) % tps_interval == 0:
-                    dt = time.perf_counter() - t_first
-                    print(f'\n[TPS] tokens={len(gen)} avg={len(gen) / max(dt, 1e-6):.1f} t/s', flush=True)
-                pos = S + len(gen) - 1
-                if pos + 1 >= max_length:
-                    break
-                out = self.model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
-                                 use_cache=True, position_ids=torch.tensor([[pos]], device=device),
-                                 return_dict=True)
-                cache = out.past_key_values
-                h = out.last_hidden_state
+                    gen.pop()
+            else:
+                # A zero-token request historically still performed the prefill.
+                self.model(input_ids=ids, past_key_values=CPUCache(), use_cache=True,
+                           position_ids=torch.arange(ids.shape[1], device=device)[None],
+                           return_dict=True, **kw)
         finally:
             configure_dash_inference(self.model, False, state=dash_state)
             cfg._ring_window, cfg.sliding_window = saved_cfg
-            if streamer is not None:
-                streamer.end()
+            observer.end()
         text = tokenizer.decode(gen, skip_special_tokens=False)
         return {'text': text, 'token_ids': gen, 'prompt_token_ids': prompt_ids,
                 'finish_reason': finish, 'num_pages_out': gen.count(page_id),
                 'expected_pages': expected_pages, 'time': time.perf_counter() - t0,
-                'prefill_time': (t_first - t0) if t_first else None}
+                'prefill_time': (observer.first_time - t0) if observer.first_time is not None else None}
 
     def _uocr_save_results(self, outputs, images, output_path):
         os.makedirs(output_path, exist_ok=True)

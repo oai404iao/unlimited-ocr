@@ -21,7 +21,8 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
 默认自动选择 CPU 路径并在加载时量化；输出写入 `results/ocr.json`。原始权重不会被修改。
-重复部署可先导出离线 INT8 模型，后续加载跳过量化。查看下一步：
+重复部署可先导出离线 INT8 模型，后续加载跳过量化。
+已有 v1 离线模型需要重新导出为 v2 safetensors；原始 BF16 数据无需重新下载。查看下一步：
 
 - [推理用法](docs/usage.md)：单页、多页、输出解释、Python 集成。
 - [离线量化与部署](docs/offline-model.md)：导出一次，复用量化文件并减少加载工作。

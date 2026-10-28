@@ -8,7 +8,7 @@ import warnings
 from unlimited_ocr.cpu_isa import POLICY
 import torch
 from torch import nn
-from torch.ao.nn.quantized.dynamic import Linear as Int8Linear
+from unlimited_ocr.cpu_linear import CPUInt8Linear
 from safetensors import safe_open
 
 
@@ -33,7 +33,7 @@ def install_bf16_sam(model, directory="models/unlimited-ocr-2"):
             return shards[name].get_tensor(key).to(torch.bfloat16)
 
         for name, module in list(sam.named_modules()):
-            if not isinstance(module, (nn.Linear, Int8Linear)):
+            if not isinstance(module, (nn.Linear, CPUInt8Linear)):
                 continue
             prefix = f"model.sam_model.{name}."
             has_bias = prefix + "bias" in mapping

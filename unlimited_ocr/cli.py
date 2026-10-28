@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--decode-threads", type=int, help="Defaults to --threads")
     parser.add_argument("--vision-chunk", type=int, default=256)
     parser.add_argument("--vision-bf16", action="store_true", help="Experimental native BF16 SAM; falls back when unsupported")
-    parser.add_argument("--baseline", action="store_true", help="Previous gathered decode, chunk64, uniform threads")
+    parser.add_argument("--baseline", action="store_true", help="Gathered decode, chunk64, uniform threads, no native MoE")
     parser.add_argument("--optimize-moe", action="store_true", help="Experimental selected-expert dispatch and packed gate/up fusion")
     parser.add_argument("--profile", action="store_true", help="Add stage attribution (has measurement overhead)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -50,15 +50,15 @@ def main():
     fused_norms = install_norm(model)
     from unlimited_ocr.cpu_vision import install_vision
     install_vision(model, query_chunk=64 if args.baseline else args.vision_chunk)
-    scripted_moe = 0
+    native_moe = 0
     if not args.baseline:
         from unlimited_ocr.cpu_sam_layout import install_sam_layout
         from unlimited_ocr.cpu_router import install_router
         install_sam_layout(model)
         install_router()
         if quantized and not args.optimize_moe:
-            from unlimited_ocr.cpu_moe_script import install_scripted_moe
-            scripted_moe = install_scripted_moe(model)
+            from unlimited_ocr.cpu_moe_native import install_native_moe
+            native_moe = install_native_moe(model)
     if args.optimize_moe:
         from unlimited_ocr.cpu_moe import install_moe
         install_moe(model, fuse=True)
@@ -92,12 +92,13 @@ def main():
                   sparse_attention=not args.dense_attention, fused_norms=fused_norms,
                   native_attention=not (args.baseline or args.dense_attention),
                   optimize_moe=args.optimize_moe, vision_threads=vision_threads, decode_threads=decode_threads,
-                  scripted_moe=scripted_moe, cached_router=not args.baseline, contiguous_sam=not args.baseline,
+                  native_moe=native_moe, cached_router=not args.baseline, contiguous_sam=not args.baseline,
                   vision_chunk=64 if args.baseline else args.vision_chunk, wall_seconds=wall_seconds,
                   load_seconds=load_time, peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
                   cpu_capability=torch.backends.cpu.get_cpu_capability(),
                   torch_version=torch.__version__)
     result.update(isa=isa_report(), weight_format=model._cpu_weight_format,
+                  linear_backend="fbgemm" if quantized else "fp32_dequantize" if model._cpu_weight_format == "int8_dequantize" else "torch",
                   bf16_vision=bf16_vision,
                   norm_backend=norm_backend(),
                   attention_backend="dense" if args.dense_attention else "gather" if args.baseline else attention_backend())

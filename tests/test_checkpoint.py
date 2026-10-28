@@ -1,12 +1,13 @@
 import json
-from collections import OrderedDict
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors import SafetensorError
+from safetensors.torch import load_file, save_file
 
 from unlimited_ocr import cpu_checkpoint as checkpoint
 from unlimited_ocr import cpu_runtime as runtime
+from unlimited_ocr import cpu_linear
 
 
 @pytest.fixture
@@ -27,11 +28,11 @@ def source(tmp_path, monkeypatch):
 
     monkeypatch.setattr(upstream, "UnlimitedOCRForCausalLM", Tiny)
     monkeypatch.setitem(runtime.POLICY, "selected", "avx2")
-    torch.backends.quantized.engine = "fbgemm"
     torch.manual_seed(23)
     model = Tiny(None)
     state = {k: v.to(torch.bfloat16) if v.is_floating_point() else v
              for k, v in model.state_dict().items()}
+    state["positions"] = state["positions"] + 17
     path = tmp_path / "source"
     path.mkdir()
     save_file(state, path / "weights.safetensors")
@@ -45,59 +46,49 @@ def source(tmp_path, monkeypatch):
 def test_round_trip_without_source_or_requantization(source, tmp_path, monkeypatch):
     expected = runtime.load_model(source)
     ids = torch.tensor([[1, 3, 7]])
-    destination = tmp_path / "export"
-    assert checkpoint.export_quantized_model(source, destination) == destination
+    destination = checkpoint.export_quantized_model(source, tmp_path / "export")
     assert checkpoint.is_quantized_checkpoint(destination)
     assert set(p.name for p in destination.iterdir()) == {
         *checkpoint.ASSETS, checkpoint.MANIFEST_FILENAME, checkpoint.STATE_FILENAME}
-    state = torch.load(destination / checkpoint.STATE_FILENAME, weights_only=True, mmap=True)
-    assert isinstance(state, OrderedDict)
-    assert state._metadata["proj"]["version"] == 4
-    assert state["proj._packed_params._packed_params"][0].is_quantized
+    state = load_file(destination / checkpoint.STATE_FILENAME)
+    assert state["proj.weight"].dtype == torch.int8
+    assert state["proj.scales"].dtype == torch.float32
+    assert all(not value.is_quantized for value in state.values())
     source.rename(tmp_path / "source-unavailable")
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("Offline load must not requantize or read safetensors")
+        raise AssertionError("Offline load must not requantize, read original shards or use pickle")
 
     monkeypatch.setattr(runtime, "pack_linear", forbidden)
     monkeypatch.setattr(runtime, "safe_open", forbidden)
-    original_load = torch.load
-
-    def checked_load(path, **options):
-        assert options == dict(map_location="cpu", weights_only=True, mmap=True)
-        return original_load(path, **options)
-
-    monkeypatch.setattr(checkpoint.torch, "load", checked_load)
+    monkeypatch.setattr(torch, "load", forbidden)
     loaded = runtime.load_model(destination)
     torch.testing.assert_close(loaded(ids), expected(ids), rtol=0, atol=0)
     assert loaded.embed.weight.dtype == torch.bfloat16
     assert loaded.embed(ids).dtype == torch.float32
-    assert loaded._cpu_weight_format == "int8"
-    assert loaded._cpu_quantized_weights
+    assert loaded._cpu_weight_format == "int8" and loaded._cpu_quantized_weights
     assert not loaded.training
     assert not any(p.requires_grad or p.is_meta for p in loaded.parameters())
     torch.testing.assert_close(loaded.positions, expected.positions)
 
 
-def test_generic_uses_dequantized_weights_without_fbgemm(source, tmp_path, monkeypatch):
+def test_generic_without_native_library(source, tmp_path, monkeypatch):
     destination = checkpoint.export_quantized_model(source, tmp_path / "export")
     packed = runtime.load_model(destination)
     monkeypatch.setitem(runtime.POLICY, "selected", "generic")
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Generic checkpoint load must not instantiate FBGEMM modules")
+    def forbidden():
+        raise AssertionError("Generic load must not load the native library")
 
-    monkeypatch.setattr(checkpoint.Int8Linear, "__init__", forbidden)
+    monkeypatch.setattr(cpu_linear, "_load_library", forbidden)
     with pytest.warns(UserWarning, match="per-operation"):
         loaded = runtime.load_model(destination)
-    assert not loaded._cpu_quantized_weights
-    assert loaded._cpu_weight_format == "int8_dequantize"
-    assert loaded.proj.weight.is_quantized
-    assert not list(loaded.proj.parameters())
+    assert not loaded._cpu_quantized_weights and loaded._cpu_weight_format == "int8_dequantize"
+    assert loaded.proj.weight.dtype == torch.int8
+    assert loaded.proj._packed is None
     x = torch.randn(2, 8)
-    w, b = packed.proj._weight_bias()
-    torch.testing.assert_close(loaded.proj(x), torch.nn.functional.linear(x, w.dequantize(), b), rtol=0, atol=0)
-    assert not any(p.requires_grad or p.is_meta for p in loaded.parameters())
+    weight = packed.proj.weight.float() * packed.proj.scales[:, None]
+    torch.testing.assert_close(loaded.proj(x), torch.nn.functional.linear(x, weight, packed.proj.bias), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("options", [{"quantized": False}, {"quantized": False, "bf16_storage": True}])
@@ -107,7 +98,7 @@ def test_reference_modes_rejected(source, tmp_path, options):
         runtime.load_model(destination, **options)
 
 
-@pytest.mark.parametrize("contents", [None, "{", '{}', '{"format": "other", "version": 1}'])
+@pytest.mark.parametrize("contents", [None, "{", '{}', '{"format": "other", "version": 2}'])
 def test_invalid_manifest_rejected(source, tmp_path, contents):
     destination = checkpoint.export_quantized_model(source, tmp_path / "export")
     manifest = destination / checkpoint.MANIFEST_FILENAME
@@ -120,25 +111,14 @@ def test_invalid_manifest_rejected(source, tmp_path, contents):
         runtime.load_model(destination)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "layer-version", "invalid-entry", "torch-version"])
-def test_serialization_versions_rejected(source, tmp_path, mutation):
+@pytest.mark.parametrize("field,value", [("version", 1), ("torch_version", "0.0.0")])
+def test_incompatible_format_rejected(source, tmp_path, field, value):
     destination = checkpoint.export_quantized_model(source, tmp_path / "export")
-    if mutation == "torch-version":
-        path = destination / checkpoint.MANIFEST_FILENAME
-        manifest = json.loads(path.read_text())
-        manifest["torch_version"] = "0.0.0"
-        path.write_text(json.dumps(manifest))
-    else:
-        path = destination / checkpoint.STATE_FILENAME
-        state = torch.load(path, weights_only=True)
-        if mutation == "missing":
-            del state._metadata
-        elif mutation == "invalid-entry":
-            state._metadata["proj"] = "invalid"
-        else:
-            state._metadata["proj"]["version"] = -1
-        torch.save(state, path)
-    with pytest.raises(ValueError, match="metadata|version"):
+    path = destination / checkpoint.MANIFEST_FILENAME
+    manifest = json.loads(path.read_text())
+    manifest[field] = value
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="re-export"):
         runtime.load_model(destination)
 
 
@@ -169,31 +149,33 @@ def test_missing_or_corrupt_state_rejected(source, tmp_path, missing):
         path.unlink()
     else:
         path.write_bytes(b"invalid checkpoint archive")
-    with pytest.raises(FileNotFoundError if missing else RuntimeError):
+    with pytest.raises(FileNotFoundError if missing else SafetensorError):
         runtime.load_model(destination)
 
 
-@pytest.mark.parametrize("mutation", ["missing-pair", "weight-shape", "weight-dtype", "bias-shape", "bias-dtype"])
-def test_invalid_weight_layout_rejected(source, tmp_path, mutation):
+@pytest.mark.parametrize("mutation", ["missing", "persistent-buffer", "weight-shape", "weight-dtype", "bias-shape", "bias-dtype", "scales", "unexpected"])
+def test_invalid_tensors_rejected(source, tmp_path, mutation):
     destination = checkpoint.export_quantized_model(source, tmp_path / "export")
     path = destination / checkpoint.STATE_FILENAME
-    state = torch.load(path, weights_only=True)
-    key = "proj._packed_params._packed_params"
-    weight, bias = state[key]
-    if mutation == "missing-pair":
-        del state[key]
+    state = {key: value.clone() for key, value in load_file(path).items()}
+    if mutation == "missing":
+        del state["proj.weight"]
+    elif mutation == "persistent-buffer":
+        del state["positions"]
+    elif mutation == "weight-shape":
+        state["proj.weight"] = state["proj.weight"][:, :-1].contiguous()
+    elif mutation == "weight-dtype":
+        state["proj.weight"] = state["proj.weight"].float()
+    elif mutation == "bias-shape":
+        state["proj.bias"] = state["proj.bias"][:-1]
+    elif mutation == "bias-dtype":
+        state["proj.bias"] = state["proj.bias"].double()
+    elif mutation == "scales":
+        state["proj.scales"].zero_()
     else:
-        if mutation == "weight-shape":
-            weight = weight[:, :-1]
-        elif mutation == "weight-dtype":
-            weight = weight.dequantize()
-        elif mutation == "bias-shape":
-            bias = bias[:-1]
-        else:
-            bias = bias.double()
-        state[key] = (weight, bias)
-    torch.save(state, path)
-    with pytest.raises(ValueError, match="INT8"):
+        state["unexpected"] = torch.zeros(1)
+    save_file(state, path)
+    with pytest.raises((ValueError, RuntimeError)):
         runtime.load_model(destination)
 
 

@@ -22,19 +22,27 @@
 |---|---|
 | `cpu_isa` | 在 Torch 初始化前检测共同 CPU 能力并设置后端策略 |
 | `cpu_runtime` | meta 初始化、逐层读取 checkpoint、量化预打包、参考权重格式 |
-| `cpu_checkpoint` | 离线量化导出、版本校验、state_dict 恢复和通用解量化回退 |
+| `cpu_checkpoint` | v2 safetensors 离线导出、版本校验、普通张量恢复 |
+| `cpu_linear` | 普通 INT8/scales/bias、运行时 packed handle、原生线性层与 FP32 回退 |
 | `cpu_attention` / `cpu_native_attention` | gathered 稀疏 prefill 和直接读取 KV 的原生 decode |
 | `cpu_cache` | 请求级 KV 缓冲区，按几何容量扩展并原地追加 |
 | `cpu_router` | 请求级已完成块摘要与增量路由统计 |
 | `cpu_norm` | RMSNorm 原生实现和 PyTorch 回退 |
 | `cpu_vision` / `cpu_sam_layout` | SAM 注意力分块与连续 BHWC 布局 |
-| `cpu_moe_script` | 单 token 选中专家的脚本化执行，复用原 packed weights |
+| `cpu_moe_native` | 单 token 选中专家的原生调度，共享 packed handle，不使用 TorchScript |
 | `cpu_threads` | 按视觉、prefill、decode 阶段调整进程全局线程数 |
 | `cpu_profile` | 阶段归因；专家计算仍计入 MoE exclusive 时间，并非纯调度开销 |
 | `cpu_moe` / `cpu_bf16_vision` | 非默认的融合 MoE / BF16 SAM 实验 |
 
-通用矩阵运算优先复用 FBGEMM 和 PyTorch SDPA。`native/` 只实现专用 RMSNorm、
-稀疏 decode 和诊断探针；共享库使用基线安全编译，ISA 特化函数通过运行时检测调用。
+矩阵运算复用 FBGEMM 和 PyTorch SDPA。`native/linear.cpp` 通过 `torch.library` 注册
+线性层及 MoE 算子，TorchBind 对象仅持有运行时打包数据，绝不写入离线文件。
+其余原生源码实现 RMSNorm、稀疏 decode 和诊断探针。共享库使用基线安全编译，
+ISA 特化函数通过运行时检测调用；FBGEMM C++ 接口随已安装 Torch 版本重新构建。
+
+生成由标准 `GenerationMixin.generate()` 驱动：请求级 `LogitsProcessor` 保留页数和
+n-gram 限制，显式传入 `CPUCache`，仅在 prefill 注入图片，词表投影仅计算最后一个位置。
+OCR 入口显式禁用 checkpoint 生成默认值替换，防止 `use_cache=False` 等训练配置改变推理。
+当前只承诺已验证版本的 eager 原生算子执行，不提供计算图导出或自定义 TorchBind 的编译接口。
 
 ## 必须保留的语义
 
@@ -43,7 +51,8 @@
 - 稀疏路径只读取选中远程块和局部 token；原生 decode 直接读取 KV，避免 gather 副本。
 - SAM query 分块仍让每个 query 关注所有 key，并保留相对位置偏置，不缩小感受野。
 - KV 与路由摘要属于当前请求，新文档必须隔离状态；权重打包对象可在请求间复用。
-- 脚本化 MoE 复用原 packed weights，不复制或重新量化；多 token prefill 保留原专家分组。
+- 原生 MoE 共享各层 packed handle，不复制或重新量化；多 token prefill 保留原专家分组。
+  安装调度后权重视为常量，切换权重请创建新模型实例，不能原地修改或重新加载现有实例。
 - FP32 路由与权重量化是不同边界，不能只为吞吐量改变选择逻辑。
 
 ## 明确限制

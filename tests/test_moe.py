@@ -88,15 +88,13 @@ def test_prefill_uses_original():
 
 def test_fusion_keeps_quantized_storage():
     model = quantize(DeepseekV2MLP(config()))
-    gate, up = model.gate_proj.weight(), model.up_proj.weight()
+    gate, up = model.gate_proj.weight, model.up_proj.weight
+    scales = torch.cat((model.gate_proj.scales, model.up_proj.scales))
     x = torch.randn(2, 5, 32)
     expected = model(x)
     install_moe(model, fuse=True)
-    fused = model.gate_up_proj.weight()
+    fused = model.gate_up_proj.weight
     assert not hasattr(model, "gate_proj") and not hasattr(model, "up_proj")
-    assert torch.equal(fused.int_repr(), torch.cat((gate.int_repr(), up.int_repr())))
-    assert torch.equal(fused.q_per_channel_scales(),
-                       torch.cat((gate.q_per_channel_scales(), up.q_per_channel_scales())))
-    assert torch.equal(fused.q_per_channel_zero_points(),
-                       torch.cat((gate.q_per_channel_zero_points(), up.q_per_channel_zero_points())))
+    assert torch.equal(fused, torch.cat((gate, up)))
+    assert torch.equal(model.gate_up_proj.scales, scales)
     torch.testing.assert_close(model(x), expected, atol=0, rtol=0)

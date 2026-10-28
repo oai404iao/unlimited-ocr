@@ -10,7 +10,7 @@
 ```sh
 .venv/bin/python -m tools.export_quantized \
   --source models/unlimited-ocr-2 \
-  --output models/unlimited-ocr-2-int8 \
+  --output models/unlimited-ocr-2-int8-v2 \
   --threads 3
 ```
 
@@ -22,9 +22,9 @@
 中断的目录不能作为已完成模型部署。重试时使用新的输出目录。
 
 ```text
-models/unlimited-ocr-2-int8/
+models/unlimited-ocr-2-int8-v2/
 ├── quantized.json       格式及 Torch 版本信息、完成标记
-├── quantized.pt         量化 state_dict，含原始量化参数和非量化权重
+├── quantized.safetensors 普通 INT8 权重、FP32 scales/bias 及其余参数
 ├── config.json
 ├── generation_config.json
 ├── tokenizer.json
@@ -42,7 +42,7 @@ models/unlimited-ocr-2-int8/
 ```sh
 .venv/bin/python -m tools.build_native
 .venv/bin/python -m unlimited_ocr.cli samples/smoke.png \
-  --model-dir models/unlimited-ocr-2-int8 \
+  --model-dir models/unlimited-ocr-2-int8-v2 \
   --max-new-tokens 192 --output results/offline.json
 ```
 
@@ -51,7 +51,7 @@ Python 调用同样支持：
 ```python
 from examples.inference import load_ocr, recognize
 
-model, tokenizer = load_ocr(model_dir="models/unlimited-ocr-2-int8")
+model, tokenizer = load_ocr(model_dir="models/unlimited-ocr-2-int8-v2")
 result = recognize(model, tokenizer, ["samples/smoke.png"], max_new_tokens=192)
 print(result["text"])
 ```
@@ -62,8 +62,9 @@ print(result["text"])
 
 ## 限制与安全
 
-- 格式使用 PyTorch 量化 `state_dict`，不是 pickled 模型对象，也不是通用 Hugging Face
-  `save_pretrained` 模型。加载明确使用 `weights_only=True`；仍只接收可信来源的文件。
+- **当前格式为 v2**，只保存 safetensors 普通张量，不含 pickle、旧式 qTensor 或运行时
+  packed handle。旧 v1 `quantized.pt` 格式不再加载，请从原始 BF16 数据重新导出到新目录。
+  这仍是本项目模型格式，不是通用 Hugging Face `save_pretrained` 模型；只接收可信来源的文件。
 - 加载要求导出端与部署端的 Torch 基础版本一致，忽略 `+cpu` 等构建后缀；更换版本应重新
   导出并验证，不提供跨版本迁移。原生二进制始终在部署端重新构建。
 - `--fp32`、`--bf16-reference`、`--vision-bf16` 需要原始权重，不能搭配离线 INT8 目录。
@@ -80,7 +81,7 @@ print(result["text"])
 .venv/bin/python -m benchmarks.benchmark_model samples/smoke.png \
   --model-dir models/unlimited-ocr-2 --repeats 3 --output results/original.json
 .venv/bin/python -m benchmarks.benchmark_model samples/smoke.png \
-  --model-dir models/unlimited-ocr-2-int8 --repeats 3 --output results/offline.json
+  --model-dir models/unlimited-ocr-2-int8-v2 --repeats 3 --output results/offline.json
 ```
 
 比较 `load_seconds`，同时核对输出 token、文本、页数和结束原因。该字段还包含优化安装、

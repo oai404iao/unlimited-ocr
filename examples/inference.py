@@ -30,8 +30,8 @@ def load_ocr(threads=3, vision_threads=6, decode_threads=3, model_dir="models/un
     install_sam_layout(model)
     install_router()
     if model._cpu_quantized_weights:
-        from unlimited_ocr.cpu_moe_script import install_scripted_moe
-        install_scripted_moe(model)
+        from unlimited_ocr.cpu_moe_native import install_native_moe
+        install_native_moe(model)
     install_stage_threads(model, vision_threads, threads, decode_threads)
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     return model, tokenizer

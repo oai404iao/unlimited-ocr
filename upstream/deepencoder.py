@@ -232,7 +232,6 @@ def get_abs_pos(abs_pos, tgt_size):
     else:
         return abs_pos
 
-@torch.jit.script
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 

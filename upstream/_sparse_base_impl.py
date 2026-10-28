@@ -146,6 +146,7 @@ try:
 except Exception:  # pragma: no cover
     import packing_patch as _pk
 from transformers.modeling_utils import PreTrainedModel
+from transformers.generation import GenerationMixin
 from transformers.pytorch_utils import (
     ALL_LAYERNORM_LAYERS,
     is_torch_greater_or_equal_than_1_13,
@@ -4085,7 +4086,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         return out
 
 
-class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
+class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):

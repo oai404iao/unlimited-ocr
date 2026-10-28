@@ -2,7 +2,7 @@
 from types import MethodType
 
 import torch
-from torch.ao.nn.quantized.dynamic import Linear as Int8Linear
+from unlimited_ocr.cpu_linear import CPUInt8Linear
 
 
 @torch.no_grad()
@@ -23,29 +23,18 @@ def _fused_mlp(self, x):
 
 def _fuse_mlp(module):
     gate, up = module.gate_proj, module.up_proj
-    if not isinstance(gate, Int8Linear) or not isinstance(up, Int8Linear):
+    if not isinstance(gate, CPUInt8Linear) or not isinstance(up, CPUInt8Linear):
         return
-    gate_weight, up_weight = gate.weight(), up.weight()
-    if (gate_weight.qscheme() != torch.per_channel_affine
-            or up_weight.qscheme() != torch.per_channel_affine
-            or gate_weight.q_per_channel_axis() != 0
-            or up_weight.q_per_channel_axis() != 0):
-        raise ValueError("Gate/up fusion requires per-output-channel INT8 weights")
     # Concatenate integer storage and quantization parameters, never dequantize
     # or requantize. Both dynamic projections see the same activation range.
-    weight = torch._make_per_channel_quantized_tensor(
-        torch.cat((gate_weight.int_repr(), up_weight.int_repr())),
-        torch.cat((gate_weight.q_per_channel_scales(), up_weight.q_per_channel_scales())),
-        torch.cat((gate_weight.q_per_channel_zero_points(), up_weight.q_per_channel_zero_points())),
-        0,
-    )
-    gate_bias, up_bias = gate.bias(), up.bias()
+    weight = torch.cat((gate.weight, up.weight))
+    scales = torch.cat((gate.scales, up.scales))
+    gate_bias, up_bias = gate.bias, up.bias
     bias = None
     if gate_bias is not None or up_bias is not None:
         bias = torch.cat((gate_bias if gate_bias is not None else torch.zeros(gate.out_features),
                           up_bias if up_bias is not None else torch.zeros(up.out_features)))
-    fused = Int8Linear(gate.in_features, gate.out_features + up.out_features, bias is not None)
-    fused.set_weight_bias(weight, bias)
+    fused = CPUInt8Linear(weight, scales, bias)
     fused.train(module.training)
     module.gate_up_proj = fused
     del module.gate_proj, module.up_proj

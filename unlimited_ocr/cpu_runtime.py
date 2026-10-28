@@ -12,7 +12,7 @@ import torch
 from accelerate import init_empty_weights
 from safetensors import safe_open
 from torch import nn
-from torch.ao.nn.quantized.dynamic import Linear as Int8Linear
+from unlimited_ocr.cpu_linear import CPUInt8Linear, native_available
 
 
 class CPUEmbedding(nn.Embedding):
@@ -37,19 +37,10 @@ def configure_cpu(threads):
         raise ValueError("threads must be positive")
     torch.set_num_threads(threads)
     torch.set_num_interop_threads(1)
-    if POLICY["selected"] != "generic":
-        torch.backends.quantized.engine = "fbgemm"
 
 
 def pack_linear(weight, bias=None):
-    weight = weight.float()
-    scales = weight.abs().amax(dim=1).clamp_min(1e-8) / 127
-    quantized = torch.quantize_per_channel(
-        weight, scales, torch.zeros(weight.shape[0], dtype=torch.int64), 0, torch.qint8
-    )
-    packed = Int8Linear(weight.shape[1], weight.shape[0], bias is not None)
-    packed.set_weight_bias(quantized, None if bias is None else bias.float())
-    return packed
+    return CPUInt8Linear.from_float(weight, bias)
 
 
 def load_model(directory="models/unlimited-ocr-2", quantized=True, bf16_storage=False):
@@ -94,6 +85,9 @@ def load_model(directory="models/unlimited-ocr-2", quantized=True, bf16_storage=
             parent = model.get_submodule(parent_name) if parent_name else model
             setattr(parent, child, pack_linear(weight, bias))
         for name, module in model.named_modules():
+            # Quantized modules already own their INT8/scales/bias buffers.
+            if isinstance(module, CPUInt8Linear):
+                continue
             if isinstance(module, nn.Embedding):
                 module.__class__ = CPUEmbedding
             if bf16_storage and isinstance(module, nn.Linear):
@@ -113,6 +107,9 @@ def load_model(directory="models/unlimited-ocr-2", quantized=True, bf16_storage=
             raise RuntimeError(f"Unloaded checkpoint tensors: {sorted(unused)}")
     if any(p.is_meta for p in model.parameters()):
         raise RuntimeError("Uninitialized meta parameters remain")
-    model._cpu_quantized_weights = quantized
-    model._cpu_weight_format = "int8" if quantized else "bf16_storage" if bf16_storage else "fp32"
+    model._cpu_quantized_weights = quantized and native_available()
+    if quantized:
+        model._cpu_weight_format = "int8" if model._cpu_quantized_weights else "int8_dequantize"
+    else:
+        model._cpu_weight_format = "bf16_storage" if bf16_storage else "fp32"
     return model.eval()

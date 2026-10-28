@@ -11,6 +11,9 @@
 CPU FP32 图像输入，接入复用 KV cache，避免读取量化 `lm_head.weight` 属性，以及
 使用单调计时。其余 CPU 优化主要由 `unlimited_ocr/cpu_*.py` 安装到模型实例或模块上。
 缓存接入使用 `unlimited_ocr` 包导入。
+生成接口通过 `GenerationMixin.generate()` 驱动，保留请求级页数/ngram 约束和最后位置的
+词表投影；`_sparse_base_impl.py` 显式继承 `GenerationMixin`。
+`deepencoder.py` 的 QuickGELU 使用原有普通张量表达式，不再在导入时编译 TorchScript。
 空的 `__init__.py` 用于本地包导入。
 
 上游模型卡标注 MIT；`_sparse_base_impl.py` 同时保留 DeepSeek-AI / HuggingFace 的

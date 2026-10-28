@@ -54,7 +54,12 @@ UOCR_CPU_ISA=avx2 .venv/bin/python -m unlimited_ocr.cli samples/smoke.png
 1. 在 meta device 创建模型，逐层读取 BF16 checkpoint，避免整模型 FP32 副本。
 2. 当前线性层临时转 FP32，按输出通道做对称 INT8 权重量化，零点为 0；
    `scale = max(max(abs(weight_row)), 1e-8) / 127`。
-3. FBGEMM 为目标 ISA 预打包权重；激活动态量化，输出仍为 FP32。
+3. 普通 `torch.int8` 权重与 FP32 scales 交给 `torch.library` 原生算子，FBGEMM 在目标
+   机器预打包；激活按张量动态量化到 uint8 reduced range，输出为 FP32。
+
+生产路径不使用 `torch.ao` 旧式量化模块、qTensor 或 TorchScript。原生 MoE 只负责选中
+专家的调度，矩阵内核仍复用 FBGEMM，不是自行重写 GEMM。TorchAO/PT2E 是已研究的替代
+方向，但其默认/已验证 CPU 路径不作为本项目的高性能默认实现；不能把“API 更新”视为加速保证。
 
 路由与 indexer 保留 FP32，Embedding 用 BF16 存储、FP32 输出；卷积和归一化等
 其他模块不套用该线性层 INT8 转换。它不是整模型所有计算都变成 INT8。
@@ -82,7 +87,7 @@ FP32，不调用 FBGEMM。该路径不能恢复量化丢失的精度，也不等
 上述命令仅演示参数，不是推荐的硬件通用最优值。
 
 - `--vision-bf16`：实验性原生 BF16 SAM，能力不足时回退；不默认开启。
-- `--optimize-moe`：实验性 gate/up 融合，替代默认脚本化专家路径；不保证整页收益。
+- `--optimize-moe`：实验性 gate/up 融合，替代默认原生专家路径；不保证整页收益。
 - `--vision-chunk`：视觉 query 分块大小，默认 256，影响内存/速度折中。
 
 精度和性能基线选项的区别见 [开发指南](development.md#测速)。
