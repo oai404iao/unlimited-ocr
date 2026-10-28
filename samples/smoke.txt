@@ -1,0 +1,6 @@
+CPU OCR TEST
+Unlimited OCR 2
+Invoice number: 2026-001
+Total: 123.45 USD
+中文识别测试
+使用 AVX2 加速 CPU 推理

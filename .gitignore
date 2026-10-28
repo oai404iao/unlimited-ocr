@@ -1,0 +1,29 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Downloaded model data (python -m tools.fetch_weights restores it)
+/models/
+*.safetensors
+*.pt
+*.pth
+*.gguf
+
+# Build artifacts
+*.so
+*.o
+*.a
+build/
+dist/
+*.egg-info/
+
+# Private inputs, generated results and local credentials
+/inputs/
+/results/
+/local/
+*.log
+.env
+.env.*
