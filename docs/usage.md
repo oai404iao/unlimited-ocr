@@ -15,6 +15,9 @@
 # 同一文档的多个页面，按顺序给出；token 预算针对整份输出
 .venv/bin/python -m unlimited_ocr.cli inputs/page-1.png inputs/page-2.png --max-new-tokens 4096 --output results/document.json
 
+# 使用已导出的离线模型；导出步骤见“离线量化与部署”
+.venv/bin/python -m unlimited_ocr.cli inputs/page.png --model-dir models/unlimited-ocr-2-int8
+
 # 完整参数说明
 .venv/bin/python -m unlimited_ocr.cli --help
 ```
@@ -33,6 +36,9 @@
 | `load_seconds` | 加载、量化、优化安装和输入准备的时间，与生成耗时分开 |
 | `isa` / `weight_format` | 实际策略与权重格式，不能只根据请求参数判断是否启用了加速 |
 | `attention_backend` / `norm_backend` | 实际注意力 / 归一化实现 |
+
+`--model-dir` 同时指定权重、配置和 tokenizer 所在目录，支持原始 BF16 数据与本项目
+[导出的离线 INT8 目录](offline-model.md)，不需要另外指定 tokenizer。
 
 `--profile` 添加阶段计时，但有额外开销。合成样例用于检查运行链路；真实文档的文字、
 布局、表格和坐标准确性仍需自行验收。数值路径变化可能改变框坐标。
@@ -66,6 +72,9 @@ print(second["finish_reason"], second["text"])
 每次调用为新文档创建 KV cache；打包权重在模型实例内复用。`load_ocr()` 和线程初始化
 每进程调用一次，不要每页重新加载模型。阶段线程和部分模型补丁是进程全局状态，
 不支持在同一进程中并发调用不同请求或其他模型。
+
+使用离线模型时，将初始化改为
+`load_ocr(model_dir="models/unlimited-ocr-2-int8")`；示例命令行同样支持 `--model-dir`。
 
 示例固定使用当前模型版本的内部生成接口，不是通用 Hugging Face 模型 API；需要完整
 运行参数时使用命令行入口。有关量化、线程和 ISA 设置，参见 [硬件与量化](acceleration.md)。

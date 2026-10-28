@@ -22,6 +22,7 @@
 |---|---|
 | `cpu_isa` | 在 Torch 初始化前检测共同 CPU 能力并设置后端策略 |
 | `cpu_runtime` | meta 初始化、逐层读取 checkpoint、量化预打包、参考权重格式 |
+| `cpu_checkpoint` | 离线量化导出、版本校验、state_dict 恢复和通用解量化回退 |
 | `cpu_attention` / `cpu_native_attention` | gathered 稀疏 prefill 和直接读取 KV 的原生 decode |
 | `cpu_cache` | 请求级 KV 缓冲区，按几何容量扩展并原地追加 |
 | `cpu_router` | 请求级已完成块摘要与增量路由统计 |

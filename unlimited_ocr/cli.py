@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("images", nargs="+")
+    parser.add_argument("--model-dir", default="models/unlimited-ocr-2", help="Original BF16 or exported offline INT8 directory")
     parser.add_argument("--threads", type=int, default=3)
     parser.add_argument("--vision-threads", type=int, default=6)
     parser.add_argument("--decode-threads", type=int, help="Defaults to --threads")
@@ -31,10 +32,13 @@ def main():
     reference.add_argument("--bf16-reference", action="store_true", help="Unquantized BF16 storage, FP32 compute (casts weights on each call)")
     parser.add_argument("--output", default="results/ocr.json")
     args = parser.parse_args()
+    from unlimited_ocr.cpu_checkpoint import is_quantized_checkpoint
+    if args.vision_bf16 and is_quantized_checkpoint(args.model_dir):
+        parser.error("--vision-bf16 requires original BF16 weights, not an offline INT8 directory")
     configure_cpu(args.threads)
     t = time.perf_counter()
     quantized = not (args.fp32 or args.bf16_reference)
-    model = load_model(quantized=quantized, bf16_storage=args.bf16_reference)
+    model = load_model(args.model_dir, quantized=quantized, bf16_storage=args.bf16_reference)
     quantized = model._cpu_quantized_weights
     if not args.dense_attention:
         from unlimited_ocr.cpu_attention import install_attention
@@ -61,12 +65,12 @@ def main():
     bf16_vision = False
     if args.vision_bf16:
         from unlimited_ocr.cpu_bf16_vision import install_bf16_sam
-        bf16_vision = install_bf16_sam(model)
+        bf16_vision = install_bf16_sam(model, directory=args.model_dir)
     vision_threads = args.threads if args.baseline else args.vision_threads
     decode_threads = args.threads if args.baseline else (args.decode_threads or args.threads)
     from unlimited_ocr.cpu_threads import install_stage_threads
     install_stage_threads(model, vision_threads, args.threads, decode_threads)
-    tokenizer = AutoTokenizer.from_pretrained("models/unlimited-ocr-2")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     from upstream.modeling_unlimitedocr import _uocr_build_inputs
     images = [Image.open(path).convert("RGB") for path in args.images]
     prompt = "<PAGE><image>" * len(images) + "Multi page parsing."

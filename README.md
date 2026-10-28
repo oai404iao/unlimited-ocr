@@ -20,10 +20,11 @@ uv pip install --python .venv/bin/python -r requirements.txt
 .venv/bin/python -m unlimited_ocr.cli samples/smoke.png --max-new-tokens 192
 ```
 
-默认自动选择 CPU 路径并在加载时量化；输出写入 `results/ocr.json`。原始权重不会被修改，
-当前不导出离线量化文件。查看下一步：
+默认自动选择 CPU 路径并在加载时量化；输出写入 `results/ocr.json`。原始权重不会被修改。
+重复部署可先导出离线 INT8 模型，后续加载跳过量化。查看下一步：
 
 - [推理用法](docs/usage.md)：单页、多页、输出解释、Python 集成。
+- [离线量化与部署](docs/offline-model.md)：导出一次，复用量化文件并减少加载工作。
 - [硬件与量化](docs/acceleration.md)：检查 ISA、选择加速、线程设置和回退边界。
 
 ## 修改项目 · 开发者

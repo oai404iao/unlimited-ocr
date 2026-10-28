@@ -11,10 +11,10 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 
-def load_ocr(threads=3, vision_threads=6, decode_threads=3):
+def load_ocr(threads=3, vision_threads=6, decode_threads=3, model_dir="models/unlimited-ocr-2"):
     """Call once per process; returned model owns reusable packed weights."""
     configure_cpu(threads)
-    model = load_model("models/unlimited-ocr-2", quantized=True)
+    model = load_model(model_dir, quantized=True)
     from unlimited_ocr.cpu_attention import install_attention
     from unlimited_ocr.cpu_native_attention import install_native_attention
     from unlimited_ocr.cpu_norm import install_norm
@@ -33,7 +33,7 @@ def load_ocr(threads=3, vision_threads=6, decode_threads=3):
         from unlimited_ocr.cpu_moe_script import install_scripted_moe
         install_scripted_moe(model)
     install_stage_threads(model, vision_threads, threads, decode_threads)
-    tokenizer = AutoTokenizer.from_pretrained("models/unlimited-ocr-2", local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     return model, tokenizer
 
 
@@ -59,10 +59,11 @@ def recognize(model, tokenizer, image_paths, max_new_tokens=256):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("images", nargs="+")
+    parser.add_argument("--model-dir", default="models/unlimited-ocr-2")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--output", default="results/example.json")
     args = parser.parse_args()
-    model, tokenizer = load_ocr()
+    model, tokenizer = load_ocr(model_dir=args.model_dir)
     result = recognize(model, tokenizer, args.images, args.max_new_tokens)
     result.update(isa=isa_report(), weight_format=model._cpu_weight_format)
     path = Path(args.output)

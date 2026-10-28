@@ -57,6 +57,11 @@ def load_model(directory="models/unlimited-ocr-2", quantized=True, bf16_storage=
     directory = Path(directory)
     if quantized and bf16_storage:
         raise ValueError("Choose INT8 or BF16 reference storage, not both")
+    from unlimited_ocr.cpu_checkpoint import is_quantized_checkpoint, load_quantized_model
+    if is_quantized_checkpoint(directory):
+        if not quantized or bf16_storage:
+            raise ValueError("Offline INT8 checkpoints do not contain original reference weights")
+        return load_quantized_model(directory)
     if quantized and POLICY["selected"] == "generic":
         warnings.warn("AVX2 unavailable/disabled: using BF16 weight storage and FP32 computation, not FBGEMM INT8")
         quantized, bf16_storage = False, True
